@@ -1,0 +1,498 @@
+#!/usr/local/bin/perl
+
+# Author: William McLean Fischer
+
+# Copyright 2012.  Los Alamos National Security, LLC. This material
+# was produced under U.S. Government contract DE-AC52-06NA25396 for
+# Los Alamos National Laboratory (LANL), which is operated by Los
+# Alamos National Security, LLC for the U.S. Department of Energy. The
+# U.S. Government has rights to use, reproduce, and distribute this
+# software.  NEITHER THE GOVERNMENT NOR LOS ALAMOS NATIONAL SECURITY,
+# LLC MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY LIABILITY
+# FOR THE USE OF THIS SOFTWARE.  If software is modified to produce
+# derivative works, such modified software should be clearly marked,
+# so as not to confuse it with the version available from LANL.
+#
+# Additionally, this program is free software; you can redistribute
+# it and/or modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation; version 2.0
+# of the License. Accordingly, this program is distributed in the
+# hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+# the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+# PURPOSE. See the GNU General Public License for more details.
+#
+# Classification review data:
+# CODE NAME:  HIV Software Suite (C11113)
+# Classification Review Number: LA-CC-11-077
+# Export Control Classification Number (ECCN): EAR99
+# B&R Code:  400412000
+
+use Getopt::Long;
+use warnings;
+use strict;
+use List::Util qw/min max/;
+use List::MoreUtils qw/uniq/;
+use GD;
+
+## Global Parameters
+our $SCALE    =  1; # SCALE
+our $CENTER   =  1; # 
+our $ROTATE   =  0; # 
+our $BLACK    =  0; # 
+our $DNA; # NOT defined -- check later
+our $COMPLEMENTARY_COLORS; # NOT defined -- check later
+our $LOCATIONS    =  0; # 
+our $IGNORE_BLANK_LINES = 1;
+our $COLORFILE;
+our $ALL_AAS_COLOR = ''; # use single color for all amino acids
+our $ALL_LOCATIONS_COLOR = ''; # use single color for all peptide locations
+our $SHOW_ONLY_LOCATIONS = 0;  # don't show underlying sequence
+our $TRANSPARENT_BACKGROUND = 0;
+our $OUTFILE = '';
+our $VERBOSE = 1;
+
+our %yesno = ( 1 => 'TRUE', 0 => 'FALSE');
+our $cmd = $0;
+$cmd =~ s/.*\///;
+sub usage {
+  die <<EOU;
+Usage: $cmd [-OPTION=value] ...
+
+creates a png file from a sequence alignment and a list of peptides;
+each residue is an individually colored pixel, colors depend
+on whether the residue is part of a covered peptide.
+
+Options (which may be abbreviated) include:
+
+BLACK (don't color amino-acids -- print all in black)
+DNA   (treat sequence as DNA -- different color scheme; default $yesno{$DNA})
+SCALE (shrink or increase plot; default is to automatically reduce to page size)
+(no)CENTER (center each AA in column (not good if font is changed later); default $yesno{$CENTER})
+(no)ROTATE (rotate page; default $yesno{$ROTATE})
+(no)IGNORE_BLANK_LINES (ignore blank lines in input; default $yesno{$IGNORE_BLANK_LINES})
+LOCATIONS  (draw a colored box around each occurrence of each peptide in a separately supplied file; default $yesno{$LOCATIONS})
+  e.g. $cmd -locations=peptidefile alignmentfile
+       where "file" contains a list of peptides of interest
+TRANSPARENT_BACKGROUND (default $yesno{$TRANSPARENT_BACKGROUND})
+OUTFILE (override default output file name)
+VERBOSE (default $yesno{$VERBOSE})
+COLORFILE  (a file of RGB color values (3 numbers per line, each between 0 and 1)
+            to use as backgrounds for located peptides)
+ALL_AAS_COLOR (color name to be used for all amino acids)
+ALL_LOCATIONS_COLOR (color name to be used for all peptide locations)
+SHOW_ONLY_LOCATIONS (don't show underlying sequence -- needs ALL_LOCATIONS_COLOR)
+COMPLEMENTARY (use complement of standard DNA colors)
+
+DNA colors: 
+      A => red
+      C => blue
+      G => black
+      T => green
+EOU
+
+}
+our $did_usage;
+
+my $options_okay = GetOptions (
+	'BLACK'       => \$BLACK,     #  BLACK (don't color amino-acids -- print all in black)
+	'DNA!'        => \$DNA,       #  DNA   (treat sequence as DNA -- different color scheme)
+	'COMPLEMENTARY'
+	              => \$COMPLEMENTARY_COLORS,
+	'LOCATIONS=s' => \$LOCATIONS, #  LOCATIONS (draw a colored box around each occurrence of each peptide in a file)
+	'ROTATE!'     => \$ROTATE,    #  rotate page
+	'IGNORE_BLANK_LINES!'  => \$IGNORE_BLANK_LINES, # (ignore blank lines in input)
+	'SCALE=f'     => \$SCALE,     #  SCALE (shrink or increase plot by this proportion)
+  'COLORFILE=s' => \$COLORFILE, # (a file of RGB color values (3 numbers per line, each between 0 and 1))
+  'ALL_AAS_COLOR=s'       => \$ALL_AAS_COLOR,       # use single color for all amino acids
+  'ALL_LOCATIONS_COLOR=s' => \$ALL_LOCATIONS_COLOR, # use single color for all peptide locations
+  'SHOW_ONLY_LOCATIONS'   => \$SHOW_ONLY_LOCATIONS, # don't show underlying sequence -- needs ALL_LOCATIONS_COLOR
+  'TRANSPARENT_BACKGROUND!' => \$TRANSPARENT_BACKGROUND,
+  'OUTFILE|OUTPUT=s' => \$OUTFILE,
+  'VERBOSE!' => \$VERBOSE,
+  'HELP'        => sub { $did_usage++; usage() },
+);
+
+if ( !$options_okay ) {
+  usage() if !$did_usage;
+  die "\n";
+}
+
+FILE:
+foreach my $alignment_file ( @ARGV ) {
+
+	my $new_suffix = ".png";
+	if ($LOCATIONS) {
+		($new_suffix = "$LOCATIONS.png") =~ s/.*\///;
+		$new_suffix = qq(-by-) . $new_suffix;
+	}
+	my @known_suffixes = qw/ fasta nex nexus simple simp table mase fast /;
+	my $outfile;
+	$outfile = ($OUTFILE ? $OUTFILE : make_outfile_name($alignment_file,\@known_suffixes,$new_suffix,1));
+
+	my @seqs_plus_names = split /\s+/, `cf $alignment_file`;
+	if ($seqs_plus_names[0] =~ /error/i) {
+		warn sprintf("cf failure!\n\t%s ...\n", join " ",@seqs_plus_names[0 .. 6]) if ($seqs_plus_names[0] =~ /error/i);
+		next FILE;
+	}
+	my %seqs_by_name = @seqs_plus_names;
+	my @seq_names =
+		map { $seqs_plus_names[$_] }
+		grep { ! ($_ % 2) }
+		(0 .. $#seqs_plus_names)
+		;
+
+	my $width  = max( map { length($_) } values(%seqs_by_name) );
+	my $height = scalar values(%seqs_by_name);
+
+	Pad_sequences_to_length:
+	{
+		for ( values %seqs_by_name ) {
+			$_ .= '-' x ($width - length($_));
+		}
+	}
+
+
+	Determine_if_alignment_is_DNA_or_protein:
+	{
+		if ( ! defined $DNA ) { # do check only if not specified by user option
+			my($digits,$total,$NTs,$AAs,$Us,$Ts);
+			for ( values %seqs_by_name ) {
+				tr/a-z/A-Z/;
+				$total += tr/A-Z0-9//;
+				$digits += tr/0-9//; # for "Standard" PAUP numerical character coding, not currently supported by this code
+				$NTs += tr/ACGTUNRYWSMKDHBV//;
+				$AAs += tr/FLIMVSPTAYHQNKDECWRG*$//;
+				$Us += tr/U/U/;
+				$Ts += tr/T/T/;
+			}
+			my $what_it_is = (($digits/$total > 0.3) ? 'Standard' : ($AAs/$NTs > 1.2) ? 'protein' : 'nucleotide');
+			if ($what_it_is eq 'nucleotide' ) {
+				warn qq($cmd: treating as DNA -- use "--noDNA" option if it really isn't\n) if ($VERBOSE);
+				$DNA++;
+			}
+		}
+	}
+
+	open my $PNGFILE, '>', $outfile 
+		and do { warn qq($cmd: writing PNG file $outfile\n) if $VERBOSE }
+		or  die  qq($cmd: unable to write file $outfile: $!\n);
+
+
+
+	our @peptides_to_locate = ();
+	our %peptide_hash       = ();
+	our @user_colors        = ();
+
+	if ($LOCATIONS) {
+		open my $peptide_file, '<', $LOCATIONS 
+			or die qq($cmd: unable to open peptide file "$LOCATIONS": $!\n);
+		@peptides_to_locate = <$peptide_file>;
+		close $peptide_file;
+
+		chomp @peptides_to_locate;
+		# split into indiv. chars or []-delimited char classes
+		%peptide_hash = 
+			map {
+				$_ => join('-*', grep {$_} split(/(\[[^\]]+\]{0,1})|/, $_) )
+			}
+			@peptides_to_locate;
+		if ($COLORFILE) {
+			open my $COLORS, '<', $COLORFILE
+				or die qq($cmd: unable to open color file "$COLORFILE": $!\n);
+			@user_colors = <$COLORS>;
+			chomp @user_colors;
+			close $COLORS;
+		}
+	}
+
+	our %COLOR_OF_AA = ();
+	if ( ! $BLACK) {
+		if (! $DNA) {
+			%COLOR_OF_AA = ( # spaces in hash values for neatness in output file
+				'.'       =>      'pale_black',
+				'?'       =>      'pale_black',
+				'X'       =>      'pale_black',
+				'H'       =>      'blue',
+				'D'       =>      'darkblue',
+				'E'       =>      'darkblue',
+				'K'       =>      'darkcyan',
+				'N'       =>      'darkcyan',
+				'Q'       =>      'darkcyan',
+				'R'       =>      'darkcyan',
+				'M'       =>      'darkgreen',
+				'F'       =>      'magenta',
+				'W'       =>      'magenta',
+				'Y'       =>      'magenta',
+				'C'       =>      'darkred',
+				'A'       =>      'darkyellow',
+				'G'       =>      'darkyellow',
+				'S'       =>      'darkyellow',
+				'T'       =>      'darkyellow',
+				'I'       =>      'green',
+				'L'       =>      'green',
+				'V'       =>      'green',
+				'*'       =>      'red',
+				'#'       =>      'red',
+				'$'       =>      'red',
+				'P'       =>      'yellow',
+			);
+		}
+		else {
+			%COLOR_OF_AA = ( # spaces in hash values for neatness in output file
+				'.'       =>      'pale_black',
+				'?'       =>      'pale_black',
+				'X'       =>      'pale_black',
+				'H'       =>      'magenta',
+				'D'       =>      'magenta',
+				'E'       =>      'magenta',
+				'K'       =>      'magenta',
+				'N'       =>      'magenta',
+				'Q'       =>      'magenta',
+				'R'       =>      'magenta',
+				'M'       =>      'magenta',
+				'F'       =>      'magenta',
+				'W'       =>      'magenta',
+				'Y'       =>      'magenta',
+				'C'       =>      'darkblue',
+				'A'       =>      'darkred',
+				'G'       =>      'black',
+				'S'       =>      'magenta',
+				'T'       =>      'green',
+				'I'       =>      'magenta',
+				'L'       =>      'magenta',
+				'V'       =>      'magenta',
+				'*'       =>      'red',
+				'#'       =>      'red',
+				'$'       =>      'red',
+				'P'       =>      'magenta',
+			);
+			if ($COMPLEMENTARY_COLORS) {
+				$COLOR_OF_AA{A} = 'green';
+				$COLOR_OF_AA{C} = 'black';
+				$COLOR_OF_AA{G} = 'darkblue';
+				$COLOR_OF_AA{T} = 'darkred';
+			}
+		}
+	}
+
+	if ($ALL_AAS_COLOR) {
+		map { $COLOR_OF_AA{$_} = $ALL_AAS_COLOR } keys %COLOR_OF_AA;
+	}
+	my @peptide__fill__colors;
+	my %peptide__fill__colors = ();
+	my %user_colors = ();
+	if ( @user_colors) {
+		map { $user_colors{"color$_"} = $user_colors[$_] }
+		map { sprintf "%02d", $_ }
+		( 0 .. $#user_colors );
+		@peptide__fill__colors = sort keys %user_colors;
+	}
+	for ( 0 .. $#peptides_to_locate ) {
+		$peptide__fill__colors{$peptides_to_locate[$_]} = $peptide__fill__colors[($_ % $#peptide__fill__colors)];
+	}
+	if ($ALL_LOCATIONS_COLOR) {
+		map { $peptide__fill__colors{$_} = $ALL_LOCATIONS_COLOR} @peptides_to_locate;
+	}
+
+	my @SWATCHES = ();
+	my $boxspot = 0;
+	#foreach my $color ( uniq(sort(keys %COLORS),sort(keys %PALE_COLORS),sort(keys %user_colors)) ) {
+	#  push @SWATCHES, sprintf "$color %d 10 5 5 rectfill\n",$boxspot += 5;
+	#}
+	my $COLOR_LEGEND = join '',@SWATCHES;
+
+	my $start_x =  " 1   inch"    ; # 1 inch from left
+	my $start_y =  "10.5 inch" ; # 10.5 inches from bottom
+	my $max_x     = 0;
+
+	our $FONTSIZE  = 18; # in points before scaling
+	our $CHARSPACE = 1; # in points before scaling
+	our $LINESPACE = 1; # in points before scaling
+	my @output = ();
+	my @final_output = ();
+	my $creator = $ENV{USER};
+	my $date = `date`;
+
+	my $myImage = new GD::Image($width,$height) || die;
+
+	# assign png format colors
+	my $black            = $myImage->colorAllocate(0,0,0);
+	my $blue             = $myImage->colorAllocate(0,0,255);
+	my $darkblue         = $myImage->colorAllocate(51,51,204);
+	my $darkcyan         = $myImage->colorAllocate(0,102,153);
+	my $darkgray         = $myImage->colorAllocate(127,127,127);
+	my $darkgreen        = $myImage->colorAllocate(51,153,51);
+	my $darkmagenta      = $myImage->colorAllocate(102,0,102);
+	my $darkred          = $myImage->colorAllocate(204,51,51);
+	my $darkyellow       = $myImage->colorAllocate(255,204,51);
+	my $green            = $myImage->colorAllocate(0,255,0);
+	my $magenta          = $myImage->colorAllocate(255,0,255);
+	my $pale_black       = $myImage->colorAllocate(127,127,127);
+	my $pale_blue        = $myImage->colorAllocate(127,127,255);
+	my $pale_darkblue    = $myImage->colorAllocate(114,114,226);
+	my $pale_darkcyan    = $myImage->colorAllocate(25,160,196);
+	my $pale_darkgray    = $myImage->colorAllocate(181,181,181);
+	my $pale_darkgreen   = $myImage->colorAllocate(114,196,114);
+	my $pale_darkmagenta = $myImage->colorAllocate(160,0,160);
+	my $pale_darkred     = $myImage->colorAllocate(226,114,114);
+	my $pale_darkyellow  = $myImage->colorAllocate(255,226,114);
+	my $pale_green       = $myImage->colorAllocate(127,255,127);
+	my $pale_magenta     = $myImage->colorAllocate(255,127,255);
+	my $pale_red         = $myImage->colorAllocate(255,127,127);
+	my $pale_yellow      = $myImage->colorAllocate(255,255,127);
+	my $red              = $myImage->colorAllocate(255,0,0);
+	my $yellow           = $myImage->colorAllocate(255,255,0);
+	my $white            = $myImage->colorAllocate(255,255,255);
+
+	# map them to names
+	my %png_colors_by_name = (
+		'black'             => $black            ,
+		'blue'              => $blue             ,
+		'darkblue'          => $darkblue         ,
+		'darkcyan'          => $darkcyan         ,
+		'darkgray'          => $darkgray         ,
+		'darkgreen'         => $darkgreen        ,
+		'darkmagenta'       => $darkmagenta      ,
+		'darkred'           => $darkred          ,
+		'darkyellow'        => $darkyellow       ,
+		'green'             => $green            ,
+		'magenta'           => $magenta          ,
+		'pale_black'        => $pale_black       ,
+		'pale_blue'         => $pale_blue        ,
+		'pale_darkblue'     => $pale_darkblue    ,
+		'pale_darkcyan'     => $pale_darkcyan    ,
+		'pale_darkgray'     => $pale_darkgray    ,
+		'pale_darkgreen'    => $pale_darkgreen   ,
+		'pale_darkmagenta'  => $pale_darkmagenta ,
+		'pale_darkred'      => $pale_darkred     ,
+		'pale_darkyellow'   => $pale_darkyellow  ,
+		'pale_green'        => $pale_green       ,
+		'pale_magenta'      => $pale_magenta     ,
+		'pale_red'          => $pale_red         ,
+		'pale_yellow'       => $pale_yellow      ,
+		'red'               => $red              ,
+		'yellow'            => $yellow           ,
+		'white'             => $white            ,
+	);
+
+	if ($TRANSPARENT_BACKGROUND) {
+		# make the background transparent
+		$myImage->transparent($white);
+	}
+	$myImage->fillToBorder(0,0,$white,$black); # no black in image yet, so entire image changed to white (transparent)
+
+
+	my $current_y = 0;
+
+	AA_SEQUENCE:
+	foreach my $seq_name ( @seq_names ) {
+		my($x,$y) = (0,$current_y);
+
+		my $seq = $seqs_by_name{$seq_name};
+		foreach my $residue ( split //, uc($seq) ) {
+			my $color = defined($COLOR_OF_AA{$residue})
+				? $png_colors_by_name{$COLOR_OF_AA{$residue}} 
+				: $white
+			;
+			$myImage->setPixel( $x++,$current_y, $color );
+		}
+
+		if ( $LOCATIONS ) {
+			my %matches = ();
+			foreach my $pept ( @peptides_to_locate ) {
+				my($color_name) = 
+				(
+					$ALL_LOCATIONS_COLOR
+						or
+					(defined($peptide__fill__colors{$pept}) 
+						? $peptide__fill__colors{$pept}
+						: 'black'
+					)
+				);
+				my $pat = $peptide_hash{$pept};
+				while ($seq =~ m/($pat)/g) {
+					my $x_range = 
+						[
+							$CHARSPACE * (pos($seq) - length($1) )  # starting offset
+							,
+							$CHARSPACE * (pos($seq)              )  # ending offset
+						]
+					;
+					foreach my $x ( $x_range->[0] .. $x_range->[1] ) {
+						if ($myImage->getPixel($x,$current_y) != $white) {
+								$myImage->setPixel($x,$current_y,$png_colors_by_name{$color_name});
+						}
+					}
+				}
+			}
+		}
+		$max_x = $x if ($x > $max_x);
+		$current_y++;
+	}
+
+	if ($SHOW_ONLY_LOCATIONS) {
+		if ($ALL_LOCATIONS_COLOR) {
+			foreach my $x ( 0 .. $width ) {
+				foreach my $y ( 0 .. $height ) {
+					if ($myImage->getPixel($x,$y) != $png_colors_by_name{$ALL_LOCATIONS_COLOR}) {
+							$myImage->setPixel($x,$y,$white);
+					}
+				}
+			}
+		}
+		else {
+			warn qq($cmd: can't show just locations unless they're all one color\n);
+		}
+	}
+
+	if ($SCALE != 1) {
+		my $scaled_width  = $SCALE * $width;
+		my $scaled_height = $SCALE * $height;
+		my $scaled_image = new GD::Image($scaled_width,$scaled_height);
+		my $white = $scaled_image->colorAllocate(255,255,255);
+		$scaled_image->transparent($white);
+		$scaled_image->fillToBorder(0,0,$white,$black); # no black in image yet, so entire image changed to white (transparent)
+		$scaled_image->copyResized($myImage,0,0,0,0,$scaled_width,$scaled_height,$width,$height);
+		print {$PNGFILE} $scaled_image->png;
+	}
+	else {
+		print {$PNGFILE} $myImage->png;
+	}
+
+}
+
+
+sub make_outfile_name {
+	my($infile_name,$known_suffix_listref,$new_suffix,$remove_final_dot) = @_;
+	my $suffix_strip_regex = join('|',@$known_suffix_listref);
+	my $outfile_name;
+	($outfile_name = $infile_name) =~ s{.*/}{};
+	$outfile_name =~ s/\.(?:$suffix_strip_regex)$//;
+	if ($remove_final_dot) { # make the dot the caller's responsibility
+		                       # i.e. have them put it in the new_suffix
+													 # when calling
+		$outfile_name =~ s/\.$//;
+	}
+	else {
+		$new_suffix =~ s/^/./;
+	}
+	$outfile_name .= "$new_suffix";
+	return($outfile_name);
+}
+__END__
+
+my($max_allowable_x,$max_allowable_y) = (468,720);
+if ($ROTATE) {
+  ($max_allowable_x,$max_allowable_y) = ($max_allowable_y,$max_allowable_x);
+}
+
+my $scale_to_fit_x = 1;
+my $scale_to_fit_y = 1;
+if ( $current_y < -$max_allowable_y and $SCALE == 1 ) {
+	$scale_to_fit_y = abs( $max_allowable_y/($current_y) );
+}
+if ( $max_x > $max_allowable_x and $SCALE == 1 ) {
+	$scale_to_fit_x = $max_allowable_x/$max_x;
+}
+$SCALE = sprintf("%.4f",min($scale_to_fit_x,$scale_to_fit_y));
+

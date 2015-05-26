@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl
+# trim fasta names to fewer chars (default 10), keeping first 2 letters of genus name
+#
+# writes to standard output, and saves a subfile script which converts names 
+# directly in the input file.
+
+while ($_ = $ARGV[0], /^-/){
+	shift;
+	/(\d+)/ and $output_name_length = $1;
+	/f/ and $force_overwrite++;
+	/g/ and $genera++;
+	/s/ and $format = 'G.species';
+	/S=(\S)/ and $sep = $1;
+	/g/ and $format = 'Genus';
+	/a/ and $format .= '_accession';
+	/r/ and $make_trim_script++;
+	/x/ and $doX++;
+}
+$output_name_length = 10 unless $output_name_length;
+$sep = 'x' unless $sep;
+warn qq(replacing spaces with "$sep"\n);
+
+$subfile = "subnames.$ARGV[0]";
+if ($make_trim_script) {
+	$subfile .= '.trim';
+}
+
+if (-e "$subfile" ) {
+	if ($force_overwrite) {
+		unlink "$subfile";
+	}
+	else {
+		print STDERR "overwrite $subfile?[Y/n] ";
+
+        	my($confirm) = getc(STDIN);
+
+        	($confirm =~ /n/i) or unlink ("$subfile");
+	}
+	if (-e "$subfile") {
+		warn "appending to re-conversion file $subfile\n";
+	}
+}
+
+while(<>) {
+
+	if ( /^>(\S+)(.*)/ ) {
+		$subfilename = ($ARGV eq '-') ? $$ : $ARGV ;
+		$subfilename = 'subnames.' . $subfilename;
+		if ($make_trim_script) {
+			$subfilename .= '.trim';
+		}
+		if (-e $subfilename) {
+			open(SUBFILE,">>$subfilename") or die "can't append to $subfilename\n";
+		}
+		else {
+			open(SUBFILE,">$subfilename") or die "can't create $subfilename\n";
+			print SUBFILE << 'END_OF_HEADER';
+#!/usr/local/bin/perl -pi.bak
+
+warn "converting $ARGV in place (original file saved as ${ARGV}.bak)\n" unless $warned++;
+
+END_OF_HEADER
+			system("chmod a+x $subfilename");
+		}
+		$orig_name = quotemeta($1);
+		$orig_name =~ s/,$// ;
+		$remainder = $2;
+		$name = $orig_name;
+		$lc_orig_name  = lc($orig_name);
+		if ( $orig_names{$orig_name} ) {
+			warn "WARNING: found duplicate name $name in input\n";
+		}
+		elsif ( $orig_names{$lc_orig_name} ) {
+			warn "WARNING: found duplicate names in input when ignoring letter case ($lc_orig_name)\n";
+		}
+		if ( ($name_len = length($name)) > $output_name_length || $doX ) {
+			if ( $genera ) {
+				$name =~ m/([A-Z][a-z]+)([_\.]{1}[A-Za-z\-\.]+)/ and ($genus,$species) = ($1,$2);
+				($gen_len = length($genus)) -= ( $name_len - $output_name_length);
+				($gen_len < 2) && ($gen_len = 2);
+	
+				$name = substr($genus,0,$gen_len) 
+			      	. substr($species,0,$output_name_length - $gen_len);
+			}
+			else {
+				$name = substr($name,0,$output_name_length);
+			}
+      #$name =~ s/[\W_]/$sep/g;
+			#$name =~ s/[^A-Za-z0-9]/$sep/g;
+			eval qq(\$name =~ tr/A-Za-z0-9/$sep/cs);
+			$lc_name = lc($name);
+			while ( $new_names{$lc_name} ) {
+        # trim off as many chars as needed given number of duplicates
+				my $tag_length = length ($new_names{$lc_name});
+        my $format = "%s%0$tag_length.0f";
+				my($fixname) = sprintf($format,
+					substr($name,0,$output_name_length - $tag_length),
+					$new_names{$lc_name}++);
+				$name = $fixname;
+				$lc_name = lc($name);
+			}
+			s/\A\s*>\s*$orig_name/$name/;
+			$new_names{$lc_name}++;
+		}
+
+		$orig_names{$lc_orig_name}++;
+
+		unless ($make_trim_script) {  # THIS IS THE DEFAULT BEHAVIOR
+			print STDOUT  ">$name$remainder\n";
+
+			if ( $using_old_underscore_handling ) {
+				# phylip and PAUP may convert underscores to spaces
+				if ($name =~ /_$/) {
+					$name =~ s/_$/_\{0,1\}/;
+				}
+				$name =~ s/_(\w)/[ _]$1/g;
+			}
+			else {
+			}
+
+			# force matching on word start and end
+			$name = '\b' . $name . '\b';
+
+			print SUBFILE "s/$name/$orig_name/;\n";
+
+		}
+		else {
+			$orig_name = '\b' . $orig_name;
+			# phylip and PAUP may convert underscores to spaces
+			$orig_name =~ s/_/./g;
+			print SUBFILE "s/$orig_name/$name/;\n";
+		}
+	}
+	else {
+		print STDOUT;
+	}
+}
+warn qq(saved script to convert names back as "$subfilename"\n);
+

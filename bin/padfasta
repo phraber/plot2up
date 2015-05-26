@@ -1,0 +1,74 @@
+#!/usr/local/bin/perl
+# $Header: /Users/wfischer/scripts/padfasta,v 1.3 2005/11/30 17:58:38 wfischer Exp wfischer $
+
+use File::Basename;
+use strict;
+no strict 'refs';
+use vars qw( $cmd $gapchar $maxlen $space $CHARS_PER_LINE @seq_names %names_seen);
+
+$cmd = basename($0);
+# takes fasta format sequences, pads each sequence with dashes to the length
+# of the longest sequence
+
+while ($_ = $ARGV[0], /^-/) {
+	shift;
+	last if /^--$/;
+	/g/ && ( $gapchar = shift );
+	/(\d+)/ && ($maxlen = $1);
+	# other switches
+}
+
+$/ = "\n>";
+$gapchar = '-' unless $gapchar;
+$space=" \t\n";
+$CHARS_PER_LINE = 50;
+$maxlen=0;
+
+while (<>) {
+			
+	# remove trailing "\n>"
+	chomp;
+
+	# remove initial > from first sequence
+	s/\A>//;
+
+	# fasta format
+	#
+  my ($seq_name,$annot,$sequence);
+	if (m/\A\s*(\S+,*)([^\n]*\n)(.*)/s){
+		($seq_name,$annot,$sequence) = ($1,$2,$3);
+		$seq_name =~ s/,$//;
+	}
+	else { next;}
+  if ($names_seen{$seq_name}++) {
+    warn "skipping sequence with duplicate name ($seq_name)\n";
+  }
+  else {
+    eval "\$sequence =~ tr/$space//d";
+    # same as above (eval with tr is slightly faster than s///)
+    # $sequence =~ s/\s+//gs;
+
+    $sequence =~ s/[$gapchar]+\z//o;
+
+    my $length = length($sequence);
+    if ($length > $maxlen) {
+      $maxlen = $length;
+    }
+    push(@seq_names,$seq_name);
+    undef %$seq_name;
+    %$seq_name = (
+      annot      => $annot,
+      seq        => $sequence,
+      seq_length => $length,
+    );
+  }
+  ##print "$seq_name->{seq_length}; MAXLEN = $maxlen\n";
+}
+
+warn "$cmd: padding sequences to $maxlen positions\n";
+
+foreach my $seq_name (@seq_names) {
+	$seq_name->{seq} .= $gapchar x ($maxlen - $seq_name->{seq_length});
+  print ">$seq_name $seq_name->{annot}";
+  while ($seq_name->{seq} =~ m/(.{1,$CHARS_PER_LINE})/go) {print "$1\n";}
+}
